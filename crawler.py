@@ -1,15 +1,17 @@
 """
 TWSE 每日收盤行情自動爬取 (TWSE Daily Closing Quotes Crawler)
 
-資料來源 (Data source)：
-    臺灣證券交易所 OpenAPI - 個股日成交資訊
-    https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
+資料來源 (Data sources)：依序嘗試，任一成功即停止
+    1. 證交所 OpenAPI  https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
+    2. 證交所官網 JSON  https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json
+    3. 證交所官網 CSV   https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=csv
 
 設計重點 (Design notes)：
     1. 冪等 (idempotent)：以 (date, code) 為主鍵，同一天重跑不會產生重複資料。
     2. 非交易日自動略過：API 在假日仍會回傳「上一個交易日」的資料，
        因此比對回傳的日期是否等於今天，不相等就正常結束、不寫入。
-    3. 失敗重試 (retry)：網路不穩時自動重試 3 次。
+    3. 多來源備援 + 診斷日誌：單一來源擋掉時自動換下一個；失敗時印出
+       HTTP 狀態碼、Content-Type、回應長度與前 200 字，方便在 Actions log 裡判讀。
     4. 離開代碼 (exit code)：0 = 成功或略過；1 = 失敗（GitHub Actions 會標記紅色並寄信）。
 
 用法 (Usage)：
@@ -19,6 +21,9 @@ TWSE 每日收盤行情自動爬取 (TWSE Daily Closing Quotes Crawler)
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import sqlite3
 import sys
 import time
@@ -30,11 +35,40 @@ import requests
 
 # ---------------------------------------------------------------- 設定 (Config)
 
-API_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+API_URLS = [
+    "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
+    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=csv",
+]
+
+# 用一般瀏覽器的標頭，避免被來源端當成機器人擋掉
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/csv, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.twse.com.tw/",
+}
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "stock.db"
 TPE = ZoneInfo("Asia/Taipei")          # 台北時區 (Taipei timezone, UTC+8，無日光節約時間)
-HEADERS = {"User-Agent": "Mozilla/5.0 (TWSE daily crawler; teaching demo)"}
+
+# 官網中文欄位 → OpenAPI 英文欄位
+CH_TO_EN = {
+    "日期": "Date",
+    "證券代號": "Code",
+    "證券名稱": "Name",
+    "成交股數": "TradeVolume",
+    "成交金額": "TradeValue",
+    "開盤價": "OpeningPrice",
+    "最高價": "HighestPrice",
+    "最低價": "LowestPrice",
+    "收盤價": "ClosingPrice",
+    "漲跌價差": "Change",
+    "漲跌(+/-)": "ChangeSign",   # 官網把正負號獨立成一欄，需與漲跌價差合併
+    "成交筆數": "Transaction",
+}
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS daily_price (
@@ -70,22 +104,27 @@ def log(msg: str) -> None:
     print(f"[{now}] {msg}", flush=True)
 
 
-def roc_to_ad(roc: str) -> str:
-    """民國日期字串轉西元 (ROC date -> AD date)：'1150915' -> '2026-09-15'。"""
-    roc = roc.strip()
-    year = int(roc[:-4]) + 1911
-    return f"{year}-{roc[-4:-2]}-{roc[-2:]}"
+def to_date(raw: str) -> str:
+    """
+    把各種日期字串統一轉成西元 YYYY-MM-DD。
+    支援民國 7 碼 '1150915'、西元 8 碼 '20260915'、以及 '115/09/15'。
+    """
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) == 8:                       # 西元 20260915
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    if len(digits) == 7:                       # 民國 1150915
+        return f"{int(digits[:3]) + 1911}-{digits[3:5]}-{digits[5:]}"
+    raise ValueError(f"無法解析的日期格式：{raw!r}")
 
 
 def to_number(value, cast=float):
     """
-    把 API 回傳的字串轉成數字。
-    TWSE 會用 '--'、''、'0.00' 等表示無資料，且數字含千分位逗號。
+    把字串轉成數字。來源會用 '--'、''、'X' 表示無資料，數字含千分位逗號。
     轉換失敗一律回傳 None，讓資料庫存 NULL，不要讓整支程式掛掉。
     """
     if value is None:
         return None
-    text = str(value).replace(",", "").replace("+", "").strip()
+    text = str(value).replace(",", "").replace("+", "").replace("　", "").strip()
     if text in ("", "--", "-", "X", "N/A"):
         return None
     try:
@@ -94,46 +133,133 @@ def to_number(value, cast=float):
         return None
 
 
-def fetch(url: str = API_URL, retries: int = 3, timeout: int = 30) -> list[dict]:
-    """抓取 API，失敗時以遞增間隔重試。"""
-    for attempt in range(1, retries + 1):
-        try:
-            log(f"抓取 API（第 {attempt} 次）：{url}")
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list) or not data:
-                raise ValueError("API 回傳空資料或格式不符")
-            log(f"抓取成功，共 {len(data)} 筆")
-            return data
-        except Exception as exc:                      # noqa: BLE001
-            log(f"抓取失敗：{exc}")
-            if attempt == retries:
-                raise
-            wait = 5 * attempt
-            log(f"{wait} 秒後重試…")
-            time.sleep(wait)
-    return []                                          # 理論上不會執行到
+# ------------------------------------------------- 各來源格式的轉換 (Normalizers)
 
+def from_openapi(payload: list) -> list[dict]:
+    """OpenAPI 直接就是 [{Date, Code, ...}, ...]。"""
+    return payload
+
+
+def from_fields_data(payload: dict) -> list[dict]:
+    """官網 JSON 格式：{"stat": "OK", "date": "20260916", "fields": [...], "data": [[...], ...]}。"""
+    if payload.get("stat") and payload["stat"] != "OK":
+        raise ValueError(f"來源回報狀態：{payload['stat']}")
+    fields = payload.get("fields") or []
+    rows = payload.get("data") or []
+    default_date = payload.get("date")
+    out = []
+    for row in rows:
+        item = {}
+        for field, cell in zip(fields, row):
+            key = CH_TO_EN.get(field.strip())
+            if key:
+                item[key] = cell
+        if "Date" not in item and default_date:
+            item["Date"] = default_date
+        out.append(item)
+    return out
+
+
+def from_csv(text: str) -> list[dict]:
+    """官網 CSV 格式：找出含「證券代號」的標題列，之後每列一檔股票。"""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    header_idx = next((i for i, ln in enumerate(lines) if "證券代號" in ln), None)
+    if header_idx is None:
+        raise ValueError("CSV 中找不到「證券代號」標題列")
+    reader = csv.reader(io.StringIO("\n".join(lines[header_idx:])))
+    header = [h.strip().strip('"').replace("=", "") for h in next(reader)]
+    out = []
+    for row in reader:
+        if len(row) < len(header):
+            continue
+        item = {}
+        for field, cell in zip(header, row):
+            key = CH_TO_EN.get(field)
+            if key:
+                item[key] = cell.strip().strip('"').replace("=", "")
+        if item.get("Code"):
+            out.append(item)
+    return out
+
+
+def parse_body(body: str) -> list[dict]:
+    """依內容自動判斷是 JSON 陣列、JSON 物件，還是 CSV。"""
+    head = body.lstrip()[:1]
+    if head == "[":
+        return from_openapi(json.loads(body))
+    if head == "{":
+        return from_fields_data(json.loads(body))
+    return from_csv(body)
+
+
+# ----------------------------------------------------------- 抓取 (Fetching)
+
+def fetch() -> list[dict]:
+    """依序嘗試每個來源，每個來源最多重試 2 次。全部失敗才拋出例外。"""
+    last_error = None
+    for url in API_URLS:
+        for attempt in (1, 2):
+            try:
+                log(f"抓取：{url}（第 {attempt} 次）")
+                resp = requests.get(url, headers=HEADERS, timeout=30)
+                ctype = resp.headers.get("Content-Type", "?")
+                body = resp.text
+                log(f"  HTTP {resp.status_code} | {ctype} | {len(body)} bytes")
+
+                if resp.status_code != 200:
+                    raise ValueError(f"HTTP {resp.status_code}")
+                if not body.strip():
+                    raise ValueError("回應是空的（來源端可能擋掉了這個 IP）")
+
+                data = parse_body(body)
+                if not data:
+                    raise ValueError("解析後沒有任何資料列")
+                log(f"  解析成功，共 {len(data)} 筆")
+                return data
+
+            except Exception as exc:                   # noqa: BLE001
+                last_error = exc
+                log(f"  失敗：{type(exc).__name__}: {exc}")
+                try:
+                    log(f"  回應前 200 字：{resp.text[:200]!r}")
+                except Exception:                      # noqa: BLE001
+                    pass
+                if attempt == 1:
+                    time.sleep(5)
+
+        log("  換下一個來源…")
+
+    raise RuntimeError(f"所有來源都失敗，最後一個錯誤：{last_error}")
+
+
+# ------------------------------------------------------ 清洗與儲存 (Transform & Save)
 
 def transform(raw: list[dict]) -> list[tuple]:
-    """把 API 的 JSON 清洗成可寫入資料庫的 tuple 清單。"""
+    """把來源資料清洗成可寫入資料庫的 tuple 清單。"""
     rows: list[tuple] = []
     for item in raw:
-        code = (item.get("Code") or "").strip()
+        code = str(item.get("Code") or "").strip()
         if not code:
             continue
+
+        # 官網把「漲跌(+/-)」與「漲跌價差」拆成兩欄，這裡合併回一個帶正負號的數字。
+        # 注意：正負號欄位可能是 HTML 標籤（如 <p style=color:green>-</p>），所以用 in 判斷。
+        change = to_number(item.get("Change"))
+        sign = str(item.get("ChangeSign") or "")
+        if change is not None and "-" in sign:
+            change = -change
+
         rows.append((
-            roc_to_ad(item["Date"]),
+            to_date(item["Date"]),
             code,
-            (item.get("Name") or "").strip(),
+            str(item.get("Name") or "").strip(),
             to_number(item.get("TradeVolume"), int),
             to_number(item.get("TradeValue"), int),
             to_number(item.get("OpeningPrice")),
             to_number(item.get("HighestPrice")),
             to_number(item.get("LowestPrice")),
             to_number(item.get("ClosingPrice")),
-            to_number(item.get("Change")),
+            change,
             to_number(item.get("Transaction"), int),
         ))
     return rows
@@ -159,8 +285,8 @@ def main() -> int:
     log(f"台北時間今日：{today}（force={force}）")
 
     raw = fetch()
-    data_date = roc_to_ad(raw[0]["Date"])
-    log(f"API 資料日期：{data_date}")
+    data_date = to_date(raw[0]["Date"])
+    log(f"資料日期：{data_date}")
 
     if data_date != today and not force:
         log("資料日期不是今天 → 判斷為非交易日或資料尚未更新，本次略過不寫入。")
