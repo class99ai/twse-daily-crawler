@@ -1,0 +1,66 @@
+# ============================================================================
+# 每日自動爬取台股收盤行情
+# 檔案位置必須是：.github/workflows/daily_crawl.yml（路徑錯了 GitHub 就看不到）
+# ============================================================================
+
+name: 每日台股收盤行情爬取
+
+# ---------------------------------------------------------------- 何時執行
+on:
+  schedule:
+    # cron 一律使用 UTC 時間！台北時間 = UTC + 8
+    # 台北 17:00 → UTC 09:00
+    # 欄位順序：分 時 日 月 星期
+    # 1-5 代表星期一到星期五
+    - cron: "0 9 * * 1-5"
+
+  # 允許在 GitHub 網頁上按按鈕手動執行（測試時一定會用到）
+  workflow_dispatch:
+
+# ------------------------------------------------- 權限：讓 Actions 可以推回程式碼
+permissions:
+  contents: write
+
+# ------------------------------------------- 避免上一次還沒跑完就又被觸發（資料庫衝突）
+concurrency:
+  group: daily-crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest        # 使用 GitHub 提供的 Ubuntu 虛擬機
+    timeout-minutes: 15           # 超過 15 分鐘就中止，避免卡住燒額度
+
+    steps:
+      # 1) 把儲存庫的檔案下載到虛擬機
+      - name: 取得程式碼
+        uses: actions/checkout@v7
+
+      # 2) 安裝 Python
+      - name: 安裝 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # 3) 安裝套件
+      - name: 安裝相依套件
+        run: pip install -r requirements.txt
+
+      # 4) 執行爬蟲
+      - name: 執行爬蟲
+        run: python crawler.py
+
+      # 5) 把更新後的資料庫推回 GitHub
+      - name: 提交資料庫變更
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/stock.db
+          if git diff --staged --quiet; then
+            echo "資料庫沒有變動（非交易日或資料相同），略過 commit"
+          else
+            git commit -m "chore(data): 更新收盤行情 $(TZ=Asia/Taipei date +%F)"
+            git push
+            echo "已推送更新"
+          fi

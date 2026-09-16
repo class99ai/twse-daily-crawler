@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 編輯器
+.vscode/
+.idea/
+.DS_Store
+
+# 注意：data/stock.db 「不要」忽略！
+# 這個專案就是要把資料庫 commit 回 GitHub，所以請勿加入 *.db
