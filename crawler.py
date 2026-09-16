@@ -265,6 +265,22 @@ def transform(raw: list[dict]) -> list[tuple]:
     return rows
 
 
+def already_have(data_date: str, db_path: Path = DB_PATH) -> bool:
+    """資料庫裡是否已經有這一天的資料？"""
+    if not db_path.exists():
+        return False
+    with sqlite3.connect(db_path) as conn:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_price'"
+        ).fetchone()
+        if not exists:
+            return False
+        n = conn.execute(
+            "SELECT COUNT(*) FROM daily_price WHERE date = ?", (data_date,)
+        ).fetchone()[0]
+    return n > 0
+
+
 def save(rows: list[tuple], db_path: Path = DB_PATH) -> int:
     """寫入 SQLite。回傳資料表總筆數。"""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,10 +302,16 @@ def main() -> int:
 
     raw = fetch()
     data_date = to_date(raw[0]["Date"])
-    log(f"資料日期：{data_date}")
+    log(f"來源資料日期：{data_date}")
+    if data_date == today:
+        log("  → 這是今天的收盤資料")
+    else:
+        log("  → 來源還沒更新到今天（非交易日，或證交所尚未發布），這是最近一個交易日的資料")
 
-    if data_date != today and not force:
-        log("資料日期不是今天 → 判斷為非交易日或資料尚未更新，本次略過不寫入。")
+    # 判斷要不要寫入，看的是「資料庫有沒有這一天」，不是「這一天是不是今天」。
+    # 這樣不管遇到週末、國定假日、颱風假，或證交所延遲發布，行為都正確。
+    if already_have(data_date) and not force:
+        log(f"資料庫已經有 {data_date} 的資料 → 略過，不重複寫入。")
         return 0
 
     rows = transform(raw)
